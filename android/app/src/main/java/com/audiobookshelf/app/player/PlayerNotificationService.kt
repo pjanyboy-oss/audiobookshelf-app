@@ -679,6 +679,10 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
               return@getLibraryItem
             }
             AbsLogger.info(tag, "handlePlaybackEnded: playing next episode ${nextEpisode.id} - ${nextEpisode.title}")
+            if (mediaProgressSyncer.currentPlaybackSession != null) {
+              AbsLogger.info(tag, "handlePlaybackEnded: user started new session during auto-advance - aborting")
+              return@getLibraryItem
+            }
             mediaManager.play(fullLibraryItem, nextEpisode, getPlayItemRequestPayload(false)) {
               if (it == null) {
                 AbsLogger.error(tag, "handlePlaybackEnded: mediaManager.play returned null - playback failed")
