@@ -48,8 +48,17 @@ android {
       ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
     }
   }
+  signingConfigs {
+    forkDebug {
+      storeFile file('fork-debug.keystore')
+      storePassword 'android'
+      keyAlias 'fork-debug'
+      keyPassword 'android'
+    }
+  }
   buildTypes {
     debug {
+      signingConfig signingConfigs.forkDebug
       applicationIdSuffix ".debug"
       versionNameSuffix "-debug"
       minifyEnabled false
