@@ -117,6 +117,17 @@ class AbsAudioPlayer : Plugin() {
       })
 
       MediaEventManager.clientEventEmitter = playerNotificationService.clientEventEmitter
+
+      // Oberflaeche neu aufgebaut, Dienst spielt weiter (z. B. nach Auto-Advance im
+      // Hintergrund): laufende Session nachreichen, sonst zeigt der Mini-Player nichts
+      // oder die alte Folge. retainUntilConsumed, weil die Vue-Listener erst spaeter
+      // registriert werden (Fork, 2026-11-02).
+      if (!PlayerNotificationService.isClosed) {
+        playerNotificationService.getCurrentPlaybackSessionCopy()?.let { session ->
+          AbsLogger.info("AbsAudioPlayer", "foregroundServiceReady: re-sending current session ${session.mediaItemId} to UI")
+          notifyListeners("onPlaybackSession", JSObject(jacksonMapper.writeValueAsString(session)), true)
+        }
+      }
     }
     mainActivity.pluginCallback = foregroundServiceReady
   }
