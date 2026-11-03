@@ -117,6 +117,17 @@ class AbsAudioPlayer : Plugin() {
       })
 
       MediaEventManager.clientEventEmitter = playerNotificationService.clientEventEmitter
+
+      // Oberflaeche neu aufgebaut, Dienst spielt weiter (z. B. nach Auto-Advance im
+      // Hintergrund): laufende Session nachreichen, sonst zeigt der Mini-Player nichts
+      // oder die alte Folge. retainUntilConsumed, weil die Vue-Listener erst spaeter
+      // registriert werden (Fork, 2026-11-02).
+      if (!PlayerNotificationService.isClosed) {
+        playerNotificationService.getCurrentPlaybackSessionCopy()?.let { session ->
+          AbsLogger.info("AbsAudioPlayer", "foregroundServiceReady: re-sending current session ${session.mediaItemId} to UI")
+          notifyListeners("onPlaybackSession", JSObject(jacksonMapper.writeValueAsString(session)), true)
+        }
+      }
     }
     mainActivity.pluginCallback = foregroundServiceReady
   }
@@ -125,6 +136,11 @@ class AbsAudioPlayer : Plugin() {
     val ret = JSObject()
     ret.put("value", value)
     notifyListeners(evtName, ret)
+  }
+
+  override fun handleOnDestroy() {
+    castManager?.detach()
+    super.handleOnDestroy()
   }
 
   override fun handleOnPause() {
@@ -229,7 +245,7 @@ class AbsAudioPlayer : Plugin() {
             return call.resolve(JSObject("{\"error\":\"Podcast episode not found\"}"))
           }
         }
-        if (!it.hasTracks(episode)) {
+        if (!it.hasTracks(mainActivity, episode)) {
           return call.resolve(JSObject("{\"error\":\"No audio files found on device. Download book again to fix.\"}"))
         }
 
@@ -325,10 +341,10 @@ class AbsAudioPlayer : Plugin() {
 
   @PluginMethod
   fun seek(call: PluginCall) {
-    val time:Int = call.getInt("value", 0) ?: 0 // Value in seconds
+    val time: Double = call.getDouble("value", 0.0) ?: 0.0 // Value in seconds, fractional
     Log.d(tag, "seek action to $time")
     Handler(Looper.getMainLooper()).post {
-      playerNotificationService.seekPlayer(time * 1000L) // convert to ms
+      playerNotificationService.seekPlayer((time * 1000L).toLong())
       call.resolve()
     }
   }

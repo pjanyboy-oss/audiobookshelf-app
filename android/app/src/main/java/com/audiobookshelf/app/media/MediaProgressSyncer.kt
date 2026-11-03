@@ -25,6 +25,18 @@ data class SyncResult(
         var serverSyncMessage: String?
 )
 
+/**
+ * Seconds of listening time to send with a sync, or null if the sync should be skipped
+ * (no start time known, or less than 1s since the last sync). [force] never skips; it is
+ * used when an episode ends so the final position is always sent.
+ */
+internal fun listeningSecondsToSync(lastSyncTime: Long, now: Long, force: Boolean): Long? {
+  if (lastSyncTime <= 0) return if (force) 0L else null
+  val diffSinceLastSync = now - lastSyncTime
+  if (diffSinceLastSync < 1000L) return if (force) 0L else null
+  return diffSinceLastSync / 1000L
+}
+
 class MediaProgressSyncer(
         val playerNotificationService: PlayerNotificationService,
         private val apiHandler: ApiHandler
@@ -179,20 +191,28 @@ class MediaProgressSyncer(
   }
 
   fun finished(cb: () -> Unit) {
-    if (!listeningTimerRunning) return
-
     listeningTimerTask?.cancel()
     listeningTimerTask = null
-    listeningTimerRunning = false
-    Log.d(tag, "finished: Stopping listening for $currentDisplayTitle")
 
-    sync(true, currentPlaybackSession?.duration ?: 0.0) { syncResult ->
-      reset()
+    val session = currentPlaybackSession
+    val duration = session?.duration ?: 0.0
 
-      currentPlaybackSession?.let { playbackSession ->
+    if (listeningTimerRunning) {
+      listeningTimerRunning = false
+      Log.d(tag, "finished: Stopping listening for $currentDisplayTitle")
+    } else {
+      // ExoPlayer fires onIsPlayingChanged(false) before STATE_ENDED, so pause() already
+      // set listeningTimerRunning=false. We still need to sync as finished and call cb().
+      Log.d(tag, "finished: Timer already stopped (paused at end), syncing as finished for $currentDisplayTitle")
+    }
+
+    // force: pause() usually ran just before (lastSyncTime 0) or a sync happened less than 1s ago.
+    // Without force sync() would skip, and the end position would never reach the server.
+    sync(true, duration, force = true) { syncResult ->
+      session?.let { playbackSession ->
         MediaEventManager.finishedEvent(playbackSession, syncResult)
       }
-
+      reset()
       cb()
     }
   }
@@ -223,17 +243,12 @@ class MediaProgressSyncer(
     }
   }
 
-  fun sync(shouldSyncServer: Boolean, currentTime: Double, cb: (SyncResult?) -> Unit) {
-    if (lastSyncTime <= 0) {
-      Log.e(tag, "Last sync time is not set $lastSyncTime")
+  fun sync(shouldSyncServer: Boolean, currentTime: Double, force: Boolean = false, cb: (SyncResult?) -> Unit) {
+    val listeningTimeToAdd = listeningSecondsToSync(lastSyncTime, System.currentTimeMillis(), force)
+    if (listeningTimeToAdd == null) {
+      if (lastSyncTime <= 0) Log.e(tag, "Last sync time is not set $lastSyncTime")
       return cb(null)
     }
-
-    val diffSinceLastSync = System.currentTimeMillis() - lastSyncTime
-    if (diffSinceLastSync < 1000L) {
-      return cb(null)
-    }
-    val listeningTimeToAdd = diffSinceLastSync / 1000L
 
     val syncData = MediaProgressSyncData(listeningTimeToAdd, currentPlaybackDuration, currentTime)
     currentPlaybackSession?.syncData(syncData)

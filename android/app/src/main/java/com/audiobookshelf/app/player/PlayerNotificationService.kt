@@ -54,6 +54,11 @@ import com.google.android.exoplayer2.ui.PlayerNotificationManager
 import com.google.android.exoplayer2.upstream.*
 import java.util.*
 import kotlin.concurrent.schedule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 
 const val SLEEP_TIMER_WAKE_UP_EXPIRATION = 120000L // 2m
@@ -115,6 +120,9 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
 
   var currentPlaybackSession: PlaybackSession? = null
   private var initialPlaybackRate: Float? = null
+
+  private val metadataScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+  private var metadataArtJob: Job? = null
 
   private var isAndroidAuto = false
 
@@ -198,6 +206,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
     castPlayer?.release()
     mediaSession.release()
     mediaProgressSyncer.reset()
+    metadataScope.cancel()
 
     super.onDestroy()
   }
@@ -295,6 +304,12 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
     transportControls = mediaController.transportControls
 
     mediaSessionConnector = MediaSessionConnector(mediaSession)
+    // Without this, the connector's default metadata provider rebuilds metadata from the
+    // player's own state on media item transitions/timeline changes, dropping the cover art
+    // bitmap that PlaybackSession.resolveCoverBitmapAsync resolves separately.
+    mediaSessionConnector.setMediaMetadataProvider { _ ->
+      currentPlaybackSession?.getMediaMetadataCompat(ctx) ?: MediaMetadataCompat.Builder().build()
+    }
     val queueNavigator: TimelineQueueNavigator =
             object : TimelineQueueNavigator(mediaSession) {
               override fun getSupportedQueueNavigatorActions(player: Player): Long {
@@ -430,8 +445,6 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
 
     isClosed = false
 
-    val metadata = playbackSession.getMediaMetadataCompat(ctx)
-    mediaSession.setMetadata(metadata)
     val mediaItems = playbackSession.getMediaItems(ctx)
     val playbackRateToUse = playbackRate ?: initialPlaybackRate ?: 1f
     initialPlaybackRate = playbackRate
@@ -458,6 +471,13 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
     DeviceManager.setLastPlaybackSession(
             playbackSession
     ) // Save playback session to use when app is closed
+
+    metadataArtJob?.cancel()
+    metadataArtJob =
+            playbackSession.resolveCoverBitmapAsync(ctx, metadataScope) {
+              mediaSessionConnector.invalidateMediaSessionMetadata()
+            }
+    mediaSessionConnector.invalidateMediaSessionMetadata()
 
     AbsLogger.info("PlayerNotificationService", "preparePlayer: Started playback session for item ${currentPlaybackSession?.mediaItemId}. MediaPlayer ${currentPlaybackSession?.mediaPlayer}")
     // Notify client
@@ -622,26 +642,74 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
 
   fun handlePlaybackEnded() {
     Log.d(tag, "handlePlaybackEnded")
-    if (isAndroidAuto && currentPlaybackSession?.isPodcastEpisode == true) {
-      Log.d(tag, "Podcast playback ended on android auto")
-      val libraryItem = currentPlaybackSession?.libraryItem ?: return
+    val isPodcastEpisode = currentPlaybackSession?.isPodcastEpisode == true
+    val autoPlay = deviceSettings.autoPlayNextPodcastEpisode
+    AbsLogger.info(tag, "handlePlaybackEnded: isPodcastEpisode=$isPodcastEpisode, isAndroidAuto=$isAndroidAuto, autoPlayNextPodcastEpisode=$autoPlay, mediaType=${currentPlaybackSession?.mediaType}")
+    if (isPodcastEpisode && (isAndroidAuto || autoPlay)) {
+      val libraryItemId = currentPlaybackSession?.libraryItemId ?: run {
+        AbsLogger.error(tag, "handlePlaybackEnded: no libraryItemId in session - aborting")
+        return
+      }
+      val currentEpisodeId = currentPlaybackSession?.episodeId
+      AbsLogger.info(tag, "handlePlaybackEnded: advancing - libraryItemId=$libraryItemId, currentEpisodeId=$currentEpisodeId")
 
       // Need to sync with server to set as finished
       mediaProgressSyncer.finished {
+        AbsLogger.info(tag, "handlePlaybackEnded: finished() complete, loading server user progress")
         // Need to reload media progress
         mediaManager.loadServerUserMediaProgress {
-          val podcast = libraryItem.media as Podcast
-          val nextEpisode = podcast.getNextUnfinishedEpisode(libraryItem.id, mediaManager)
-          Log.d(tag, "handlePlaybackEnded nextEpisode=$nextEpisode")
-          nextEpisode?.let { podcastEpisode ->
-            mediaManager.play(libraryItem, podcastEpisode, getPlayItemRequestPayload(false)) {
-              if (it == null) {
-                Log.e(tag, "Failed to play library item")
-              } else {
-                val playbackRate = mediaManager.getSavedPlaybackRate()
-                Handler(Looper.getMainLooper()).post { preparePlayer(it, true, playbackRate) }
+          AbsLogger.info(tag, "handlePlaybackEnded: user progress loaded (${mediaManager.serverUserMediaProgress.size} items), fetching full library item $libraryItemId")
+          // Fetch full library item to ensure episodes list is populated
+          // (PlaybackSession response does not include the full episode list)
+          apiHandler.getLibraryItem(libraryItemId) { fullLibraryItem ->
+            if (fullLibraryItem == null) {
+              AbsLogger.error(tag, "handlePlaybackEnded: getLibraryItem returned null for $libraryItemId - aborting")
+              return@getLibraryItem
+            }
+            val podcast = fullLibraryItem.media as? Podcast
+            if (podcast == null) {
+              AbsLogger.error(tag, "handlePlaybackEnded: media is not a Podcast for $libraryItemId (mediaType=${fullLibraryItem.mediaType}) - aborting")
+              return@getLibraryItem
+            }
+            val episodeCount = podcast.episodes?.size ?: 0
+            AbsLogger.info(tag, "handlePlaybackEnded: podcast has $episodeCount episodes, finding next after $currentEpisodeId")
+
+            fun advanceToNextEpisode(afterEpId: String?) {
+              val nextEpisode = podcast.getNextUnfinishedEpisode(fullLibraryItem.id, mediaManager, afterEpId)
+              if (nextEpisode == null) {
+                AbsLogger.info(tag, "handlePlaybackEnded: no next unfinished episode found after $afterEpId (total=$episodeCount)")
+                return
+              }
+              AbsLogger.info(tag, "handlePlaybackEnded: checking server progress for candidate ${nextEpisode.id} - ${nextEpisode.title}")
+              apiHandler.getMediaProgress(fullLibraryItem.id, nextEpisode.id, DeviceManager.serverConnectionConfig) { mediaProgress ->
+                if (mediaProgress != null && mediaProgress.isFinished) {
+                  AbsLogger.info(tag, "handlePlaybackEnded: candidate ${nextEpisode.id} is finished on server (progress=${mediaProgress.progress}) - skipping")
+                  advanceToNextEpisode(nextEpisode.id)
+                  return@getMediaProgress
+                }
+                val serverStartTime = mediaProgress?.currentTime ?: 0.0
+                AbsLogger.info(tag, "handlePlaybackEnded: playing next episode ${nextEpisode.id} - ${nextEpisode.title} with serverStartTime=$serverStartTime")
+                if (mediaProgressSyncer.currentPlaybackSession != null) {
+                  AbsLogger.info(tag, "handlePlaybackEnded: user started new session during auto-advance - aborting")
+                  return@getMediaProgress
+                }
+                mediaManager.play(fullLibraryItem, nextEpisode, getPlayItemRequestPayload(false)) { newSession ->
+                  if (newSession == null) {
+                    AbsLogger.error(tag, "handlePlaybackEnded: mediaManager.play returned null - playback failed")
+                  } else {
+                    if (serverStartTime > 0.0) {
+                      AbsLogger.info(tag, "handlePlaybackEnded: overriding new session currentTime with server startTime=$serverStartTime (was ${newSession.currentTime})")
+                      newSession.currentTime = serverStartTime
+                    }
+                    AbsLogger.info(tag, "handlePlaybackEnded: new playback session started ${newSession.id} for '${newSession.displayTitle}' at ${newSession.currentTime}")
+                    val playbackRate = mediaManager.getSavedPlaybackRate()
+                    Handler(Looper.getMainLooper()).post { preparePlayer(newSession, true, playbackRate) }
+                  }
+                }
               }
             }
+
+            advanceToNextEpisode(currentEpisodeId)
           }
         }
       }

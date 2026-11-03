@@ -200,6 +200,22 @@ export default {
       const startWhenReady = !payload.paused
 
       const isLocal = libraryItemId.startsWith('local')
+      // Fertig gehörte Folge: der Server setzt sie beim Start still auf 0 zurück
+      // ("resetting progress for finished item"). Vorher fragen (Fork, 2026-11-02).
+      if (!isLocal && episodeId && (startTime === undefined || startTime === null)) {
+        const progress = this.$store.getters['user/getUserMediaProgress'](libraryItemId, episodeId)
+        if (progress?.isFinished) {
+          const { value } = await Dialog.confirm({
+            title: 'Schon gehört',
+            message: 'Diese Folge hast du schon zu Ende gehört. Von vorn abspielen?'
+          })
+          if (!value) {
+            await AbsLogger.info({ tag: 'AudioPlayerContainer', message: `playLibraryItem: finished episode ${episodeId} not restarted (user declined)` })
+            this.$store.commit('setPlayerDoneStartingPlayback')
+            return
+          }
+        }
+      }
       if (!isLocal) {
         const hasPermission = await this.checkCellularPermission('streaming')
         if (!hasPermission) {
@@ -229,7 +245,7 @@ export default {
         console.log('Already streaming item', startTime)
         if (startTime !== undefined && startTime !== null) {
           // seek to start time
-          AbsAudioPlayer.seek({ value: Math.floor(startTime) })
+          AbsAudioPlayer.seek({ value: startTime })
         } else if (this.$refs.audioPlayer) {
           this.$refs.audioPlayer.play()
         }

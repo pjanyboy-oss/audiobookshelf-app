@@ -28,7 +28,7 @@ jobs:
           java-version: 21
 
       - name: install dependencies
-        run: npm ci
+        run: npm ci --omit=optional
 
       - name: build Nuxt project
         run: npm run generate
@@ -38,6 +38,9 @@ jobs:
 
       - name: build Android app
         run: ./android/gradlew assembleDebug -p android --no-daemon
+
+      - name: run Android unit tests
+        run: ./android/gradlew testDebugUnitTest -p android --no-daemon
 
       - name: rename apk
         working-directory: android/app/build/outputs/apk/debug/
