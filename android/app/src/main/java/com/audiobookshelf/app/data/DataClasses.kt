@@ -118,21 +118,27 @@ class Podcast(
 
   @JsonIgnore
   fun getNextUnfinishedEpisode(libraryItemId:String, mediaManager: MediaManager, afterEpisodeId: String? = null):PodcastEpisode? {
-    val sortedEpisodes = episodes?.sortedBy { it.publishedAt ?: 0L } ?: return null
-    if (afterEpisodeId != null) {
-      val idx = sortedEpisodes.indexOfFirst { it.id == afterEpisodeId }
-      if (idx >= 0) {
-        return sortedEpisodes.drop(idx + 1).find { ep ->
-          val prog = mediaManager.serverUserMediaProgress.find { it.libraryItemId == libraryItemId && it.episodeId == ep.id }
-          prog == null || !prog.isFinished
-        }
-      }
-    }
-    return sortedEpisodes.find { episode ->
+    return findNextUnfinishedEpisode(episodes ?: return null, afterEpisodeId) { episode ->
       val progress = mediaManager.serverUserMediaProgress.find { it.libraryItemId == libraryItemId && it.episodeId == episode.id }
-      progress == null || !progress.isFinished
+      progress != null && progress.isFinished
     }
   }
+}
+
+/**
+ * Picks the episode to play next, oldest first (publishedAt ascending, missing date counts as oldest).
+ * With [afterEpisodeId] only episodes after that one are considered; if it is the last one, null is returned.
+ * If [afterEpisodeId] is null or unknown, the oldest unfinished episode is returned.
+ */
+internal fun findNextUnfinishedEpisode(episodes: List<PodcastEpisode>, afterEpisodeId: String?, isFinished: (PodcastEpisode) -> Boolean): PodcastEpisode? {
+  val sortedEpisodes = episodes.sortedBy { it.publishedAt ?: 0L }
+  if (afterEpisodeId != null) {
+    val idx = sortedEpisodes.indexOfFirst { it.id == afterEpisodeId }
+    if (idx >= 0) {
+      return sortedEpisodes.drop(idx + 1).find { !isFinished(it) }
+    }
+  }
+  return sortedEpisodes.find { !isFinished(it) }
 }
 
 @JsonIgnoreProperties(ignoreUnknown = true)
